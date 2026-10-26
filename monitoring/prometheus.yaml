@@ -1,0 +1,120 @@
+# Prometheus inside your own namespace, for users without access to
+# openshift-monitoring. Apply with: oc apply -f monitoring/prometheus.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chaos-prometheus
+---
+# Lets Prometheus discover pods in THIS namespace only (uses the built-in "view" role)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chaos-prometheus-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: chaos-prometheus
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chaos-prometheus-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+    scrape_configs:
+      # Availability as a customer sees it: is ANY API pod answering via the Service?
+      # Only the built-in "up" series is kept (samples dropped to avoid mixing pods).
+      - job_name: chaos-api-service
+        static_configs:
+          - targets: ["chaos-api:8080"]
+        metric_relabel_configs:
+          - action: drop
+            regex: ".*"
+            source_labels: [__name__]
+      # App metrics from each API pod individually (request counts, latency).
+      - job_name: chaos-api-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              own_namespace: true
+        relabel_configs:
+          - action: keep
+            source_labels: [__meta_kubernetes_pod_label_deployment]
+            regex: chaos-api
+          - action: keep
+            source_labels: [__meta_kubernetes_pod_container_port_number]
+            regex: "8080"
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chaos-prometheus
+  labels:
+    app: chaos-prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chaos-prometheus
+  template:
+    metadata:
+      labels:
+        app: chaos-prometheus
+    spec:
+      serviceAccountName: chaos-prometheus
+      containers:
+        - name: prometheus
+          image: quay.io/prometheus/prometheus:v2.55.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=2d
+            - --web.enable-lifecycle
+          ports:
+            - containerPort: 9090
+          readinessProbe:
+            httpGet: { path: /-/ready, port: 9090 }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - name: config
+          configMap: { name: chaos-prometheus-config }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chaos-prometheus
+spec:
+  selector:
+    app: chaos-prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: chaos-prometheus
+spec:
+  to:
+    kind: Service
+    name: chaos-prometheus
+  port:
+    targetPort: 9090
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

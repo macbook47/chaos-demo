@@ -1,0 +1,24 @@
+# App-level SLOs for Krkn's resiliency score, evaluated against the namespace Prometheus.
+# Krkn semantics: each expr is checked over the chaos window; any value > 0 = SLO FAILED.
+# "> bool X" returns 1 when violated and 0 when fine.
+# Krkn samples every 10s, so the availability checks look at the worst value in each 10s window.
+
+- expr: min_over_time(up{job="chaos-api-service"}[10s]) == bool 0
+  description: API unreachable through its Service (customer-visible outage)
+  severity: critical
+
+- expr: |
+    sum(rate(chaos_http_requests_total{code=~"5.."}[30s]))
+      / sum(rate(chaos_http_requests_total[30s])) > bool 0.01
+  description: API error rate above 1%
+  severity: critical
+
+- expr: |
+    histogram_quantile(0.95,
+      sum by (le) (rate(chaos_http_request_duration_seconds_bucket[30s]))) > bool 1
+  description: API p95 latency above 1 second
+  severity: warning
+
+- expr: count(min_over_time(up{job="chaos-api-pods"}[10s]) == 1) < bool 2
+  description: Fewer than 2 API pods ready to serve (redundancy lost)
+  severity: warning
